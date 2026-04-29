@@ -72,6 +72,9 @@ func (e *eventstreamDecoder) Next() bool {
 
 	msg, err := e.Decoder.Decode(e.rc, nil)
 	if err != nil {
+		if err == io.EOF {
+			return false
+		}
 		e.err = err
 		return false
 	}
@@ -106,57 +109,46 @@ func (e *eventstreamDecoder) Next() bool {
 				Type: gjson.GetBytes(decoded, "type").String(),
 				Data: decoded,
 			}
+			return true
 		}
+		return e.Next()
 
-	case eventstreamapi.ExceptionMessageType:
-		// See https://github.com/aws/aws-sdk-go-v2/blob/885de40869f9bcee29ad11d60967aa0f1b571d46/service/iotsitewise/deserializers.go#L15511C1-L15567C2
-		exceptionType := msg.Headers.Get(eventstreamapi.ExceptionTypeHeader)
-		if exceptionType == nil {
-			e.err = fmt.Errorf("%s event header not present", eventstreamapi.ExceptionTypeHeader)
-			return false
-		}
-
-		// See https://github.com/aws/aws-sdk-go-v2/blob/885de40869f9bcee29ad11d60967aa0f1b571d46/aws/protocol/restjson/decoder_util.go#L15-L48k
-		var errInfo struct {
-			Code    string
-			Type    string `json:"__type"`
-			Message string
-		}
-		err = json.Unmarshal(msg.Payload, &errInfo)
-		if err != nil && err != io.EOF {
-			e.err = fmt.Errorf("received exception %s: parsing exception payload failed: %w", exceptionType.String(), err)
-			return false
-		}
-
+	case eventstreamapi.ExceptionMessageType, eventstreamapi.ErrorMessageType:
 		errorCode := "UnknownError"
 		errorMessage := errorCode
-		if ev := exceptionType.String(); len(ev) > 0 {
-			errorCode = ev
-		} else if len(errInfo.Code) > 0 {
-			errorCode = errInfo.Code
-		} else if len(errInfo.Type) > 0 {
-			errorCode = errInfo.Type
-		}
 
-		if len(errInfo.Message) > 0 {
-			errorMessage = errInfo.Message
-		}
-		e.err = fmt.Errorf("received exception %s: %s", errorCode, errorMessage)
-		return false
+		if messageType.String() == eventstreamapi.ExceptionMessageType {
+			exceptionType := msg.Headers.Get(eventstreamapi.ExceptionTypeHeader)
+			if exceptionType != nil {
+				errorCode = exceptionType.String()
+			}
+			var errInfo struct {
+				Code    string
+				Type    string `json:"__type"`
+				Message string
+			}
+			if err := json.Unmarshal(msg.Payload, &errInfo); err == nil {
+				if len(errInfo.Code) > 0 {
+					errorCode = errInfo.Code
+				} else if len(errInfo.Type) > 0 {
+					errorCode = errInfo.Type
+				}
+				if len(errInfo.Message) > 0 {
+					errorMessage = errInfo.Message
+				}
+			}
+		} else {
+			if header := msg.Headers.Get(eventstreamapi.ErrorCodeHeader); header != nil {
+				errorCode = header.String()
+			}
+			if header := msg.Headers.Get(eventstreamapi.ErrorMessageHeader); header != nil {
+				errorMessage = header.String()
+			}
+			e.err = fmt.Errorf("received error %s: %s", errorCode, errorMessage)
+			return false
 
-	case eventstreamapi.ErrorMessageType:
-		errorCode := "UnknownError"
-		errorMessage := errorCode
-		if header := msg.Headers.Get(eventstreamapi.ErrorCodeHeader); header != nil {
-			errorCode = header.String()
 		}
-		if header := msg.Headers.Get(eventstreamapi.ErrorMessageHeader); header != nil {
-			errorMessage = header.String()
-		}
-		e.err = fmt.Errorf("received error %s: %s", errorCode, errorMessage)
-		return false
 	}
-
 	return true
 }
 
@@ -164,9 +156,7 @@ func (e *eventstreamDecoder) Event() ssestream.Event {
 	return e.evt
 }
 
-var (
-	_ ssestream.Decoder = &eventstreamDecoder{}
-)
+var _ ssestream.Decoder = &eventstreamDecoder{}
 
 func init() {
 	ssestream.RegisterDecoder("application/vnd.amazon.eventstream", func(rc io.ReadCloser) ssestream.Decoder {
